@@ -1,57 +1,48 @@
-name: "BCOS Scan"
-description: "Reusable GitHub Action to scan, score, and attest PRs via BCOS v2 protocol"
+name: "BCOS v2 Scan"
+description: "Run the official BCOS v2 engine, report results, and anchor merged attestations"
 author: "RustChain BCOS"
 
 inputs:
   tier:
-    description: "Review tier (L0, L1, L2)"
-    required: true
-    type: choice
-    options:
-      - L0
-      - L1
-      - L2
-  reviewer:
-    description: "GitHub login of the assigned reviewer"
+    description: "Certification tier: L0, L1, or L2"
     required: false
-    type: string
+    default: "L1"
+  reviewer:
+    description: "Human reviewer handle (required by the engine for L2)"
+    required: false
     default: ""
   node-url:
-    description: "BCOS v2 node RPC URL (e.g. https://bcos.rustchain.org)"
+    description: "RustChain node base URL used to anchor merged attestations"
     required: false
-    type: string
-    default: "https://50.28.86.131"
-  pr-number:
-    description: "PR number to comment on (defaults to current PR)"
+    default: "https://rustchain.org"
+  github-token:
+    description: "Token used to create or update the pull-request comment"
     required: false
-    type: string
-    default: ""
-  repo-token:
-    description: "GitHub token for API calls"
-    required: true
-    type: string
+    default: ${{ github.token }}
 
 outputs:
   trust_score:
     description: "BCOS trust score (0-100)"
-    value: ${{ steps.scan.outputs.trust_score }}
+    value: ${{ steps.bcos.outputs.trust_score }}
   cert_id:
     description: "BCOS attestation certificate ID"
-    value: ${{ steps.scan.outputs.cert_id }}
+    value: ${{ steps.bcos.outputs.cert_id }}
   tier_met:
     description: "Whether the required tier was met (true/false)"
-    value: ${{ steps.scan.outputs.tier_met }}
+    value: ${{ steps.bcos.outputs.tier_met }}
 
 runs:
   using: "composite"
   steps:
-    - id: scan
+    - id: bcos
       shell: bash
       env:
         INPUT_TIER: ${{ inputs.tier }}
         INPUT_REVIEWER: ${{ inputs.reviewer }}
         INPUT_NODE_URL: ${{ inputs.node-url }}
-        INPUT_PR_NUMBER: ${{ inputs.pr-number }}
-        INPUT_REPO_TOKEN: ${{ inputs.repo-token }}
-      run: ${{ github.action_path }}/entrypoint.sh
-      working-directory: ${{ github.workspace }}
+        INPUT_GITHUB_TOKEN: ${{ inputs.github-token }}
+      run: python3 "${{ github.action_path }}/main.py"
+
+branding:
+  icon: "shield"
+  color: "blue"
