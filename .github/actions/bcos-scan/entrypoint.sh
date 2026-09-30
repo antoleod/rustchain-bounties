@@ -1,322 +1,195 @@
 #!/usr/bin/env bash
-# =============================================================================
-# BCOS Scan — Reusable GitHub Action (BCOS v2)
-# Scans a PR, computes trust score, certifies it, and anchors attestation.
-# =============================================================================
+# SPDX-License-Identifier: MIT
 set -euo pipefail
 
-# ---- Inputs ----
-TIER="${INPUT_TIER:-L0}"
+TIER="${INPUT_TIER:-L1}"
 REVIEWER="${INPUT_REVIEWER:-}"
-NODE_URL="${INPUT_NODE_URL:-https://50.28.86.131}"
+NODE_URL="${INPUT_NODE_URL:-https://rustchain.org}"
 PR_NUMBER="${INPUT_PR_NUMBER:-}"
-GITHUB_TOKEN="${INPUT_REPO_TOKEN:-}"
+ENGINE_URL="${INPUT_ENGINE_URL:-https://raw.githubusercontent.com/Scottcjn/Rustchain/main/tools/bcos_engine.py}"
+GITHUB_TOKEN="${INPUT_REPO_TOKEN:-${ACTION_GITHUB_TOKEN:-}}"
 REPO="${GITHUB_REPOSITORY:-}"
-ACTOR="${GITHUB_ACTOR:-unknown}"
-EVENT="${GITHUB_EVENT_NAME:-unknown}"
-SHA="${GITHUB_SHA:-unknown}"
-RUN_ID="${GITHUB_RUN_ID:-0}"
+EVENT="${GITHUB_EVENT_NAME:-}"
+SHA="${GITHUB_SHA:-}"
+RUN_ID="${GITHUB_RUN_ID:-}"
 RUN_URL="${GITHUB_SERVER_URL:-https://github.com}/${REPO}/actions/runs/${RUN_ID}"
+WORKSPACE="${GITHUB_WORKSPACE:-$PWD}"
 
-# Derive PR number from event payload if not provided
-if [[ -z "$PR_NUMBER" ]] && [[ -f "$GITHUB_EVENT_PATH" ]]; then
-  PR_NUMBER=$(jq -r '.pull_request.number // .issue.number // empty' "$GITHUB_EVENT_PATH" 2>/dev/null || echo "")
+case "$TIER" in
+  L0|L1|L2) ;;
+  *)
+    echo "::error::tier must be one of L0, L1, or L2"
+    exit 2
+    ;;
+esac
+
+if [[ -z "$PR_NUMBER" && -n "${GITHUB_EVENT_PATH:-}" && -f "$GITHUB_EVENT_PATH" ]]; then
+  PR_NUMBER=$(jq -r '.pull_request.number // .issue.number // empty' "$GITHUB_EVENT_PATH" 2>/dev/null || true)
 fi
 
-if [[ -z "$PR_NUMBER" ]]; then
-  echo "::error::Could not determine PR number. Set pr-number input or trigger on pull_request/issue event."
-  exit 1
-fi
-
-echo "BCOS Scan starting for PR #$PR_NUMBER (tier=$TIER, reviewer=$REVIEWER, node=$NODE_URL)"
-
-# ---- 1. Fetch PR metadata ----
-fetch_pr() {
-  curl -s -H "Authorization: token $GITHUB_TOKEN" \
-    -H "Accept: application/vnd.github.v3+json" \
-    "https://api.github.com/repos/${REPO}/pulls/${PR_NUMBER}"
-}
-
-fetch_pr_labels() {
-  curl -s -H "Authorization: token $GITHUB_TOKEN" \
-    -H "Accept: application/vnd.github.v3+json" \
-    "https://api.github.com/repos/${REPO}/issues/${PR_NUMBER}/labels"
-}
-
-fetch_pr_files() {
-  curl -s -H "Authorization: token $GITHUB_TOKEN" \
-    -H "Accept: application/vnd.github.v3+json" \
-    "https://api.github.com/repos/${REPO}/pulls/${PR_NUMBER}/files?per_page=100"
-}
-
-# ---- 2. Compute trust_score ----
-# Trust score factors:
-#   - Base by tier: L0=30, L1=60, L2=90
-#   - Reviewer bonus: +10 if a reviewer is assigned
-#   - Review quality: +5 per approval, -10 per change request
-#   - File diversity: +5 if 3+ distinct path prefixes touched
-#   - Max score: 100
-compute_trust_score() {
-  local base_score=0
-  case "$TIER" in
-    L0) base_score=30 ;;
-    L1) base_score=60 ;;
-    L2) base_score=90 ;;
-    *)  base_score=30 ;;
-  esac
-
-  local reviewer_bonus=0
-  if [[ -n "$REVIEWER" ]]; then
-    reviewer_bonus=10
+api() {
+  local method="$1"
+  local url="$2"
+  local data="${3:-}"
+  local args=(-sS -X "$method" -H "Accept: application/vnd.github+json")
+  if [[ -n "$GITHUB_TOKEN" ]]; then
+    args+=(-H "Authorization: Bearer $GITHUB_TOKEN")
   fi
-
-  # Count files changed (rough heuristic via API)
-  local file_count
-  file_count=$(fetch_pr_files | jq '. | length' 2>/dev/null || echo "1")
-  local diversity_bonus=0
-  if [[ "$file_count" -ge 3 ]]; then
-    diversity_bonus=5
+  if [[ -n "$data" ]]; then
+    args+=(-H "Content-Type: application/json" --data-raw "$data")
   fi
+  curl "${args[@]}" "$url"
+}
 
-  local score=$((base_score + reviewer_bonus + diversity_bonus))
-  if [[ "$score" -gt 100 ]]; then
-    score=100
+download_engine() {
+  local dest="$1"
+  echo "Downloading BCOS v2 engine from $ENGINE_URL"
+  curl -fsSL "$ENGINE_URL" -o "$dest"
+  python3 -m py_compile "$dest"
+}
+
+run_engine() {
+  local engine="$1"
+  local report="$2"
+  set +e
+  python3 "$engine" "$WORKSPACE" --tier "$TIER" --reviewer "$REVIEWER" --commit "$SHA" --json > "$report"
+  local rc=$?
+  set -e
+  if [[ ! -s "$report" ]]; then
+    echo "::error::BCOS engine did not produce a JSON report"
+    exit 1
   fi
-  echo "$score"
-}
-
-# ---- 3. Determine tier_met ----
-tier_met() {
-  local score=$1
-  case "$TIER" in
-    L0) [[ "$score" -ge 30 ]] && echo "true" || echo "false" ;;
-    L1) [[ "$score" -ge 60 ]] && echo "true" || echo "false" ;;
-    L2) [[ "$score" -ge 80 ]] && echo "true" || echo "false" ;;
-    *)  echo "false" ;;
-  esac
-}
-
-# ---- 4. Generate cert_id ----
-# Format: BCOS-{TIER}-{SHA_SHORT}-{TIMESTAMP}
-generate_cert_id() {
-  local sha_short
-  sha_short=$(echo "$SHA" | cut -c1-8 | tr '[:lower:]' '[:upper:]')
-  local ts
-  ts=$(date +%s | tail -c 6)
-  echo "BCOS-${TIER}-${sha_short}-${ts}"
-}
-
-# ---- 5. Build attestation payload ----
-build_attestation() {
-  local score=$1
-  local cert_id=$2
-  local met=$3
-  local pr_title
-  pr_title=$(fetch_pr | jq -r '.title // "unknown"' 2>/dev/null || echo "unknown")
-  local pr_state
-  pr_state=$(fetch_pr | jq -r '.state // "unknown"' 2>/dev/null || echo "unknown")
-  local base_ref
-  base_ref=$(fetch_pr | jq -r '.base.ref // "unknown"' 2>/dev/null || echo "unknown")
-  local head_ref
-  head_ref=$(fetch_pr | jq -r '.head.ref // "unknown"' 2>/dev/null || echo "unknown")
-
-  jq -n \
-    --arg schema "bcos-attestation/v2" \
-    --arg repo "$REPO" \
-    --arg cert "$cert_id" \
-    --arg tier "$TIER" \
-    --arg score "$score" \
-    --arg met "$met" \
-    --arg pr_num "$PR_NUMBER" \
-    --arg pr_title "$pr_title" \
-    --arg pr_state "$pr_state" \
-    --arg base "$base_ref" \
-    --arg head "$head_ref" \
-    --arg actor "$ACTOR" \
-    --arg reviewer "$REVIEWER" \
-    --arg sha "$SHA" \
-    --arg event "$EVENT" \
-    --arg url "$RUN_URL" \
-    --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    '{
-      schema: $schema,
-      repo: $repo,
-      cert_id: $cert,
-      tier: $tier,
-      trust_score: ($score | tonumber),
-      tier_met: ($met == "true"),
-      pr: {
-        number: ($pr_num | tonumber),
-        title: $pr_title,
-        state: $pr_state,
-        base_ref: $base,
-        head_ref: $head
-      },
-      actor: $actor,
-      reviewer: $reviewer,
-      head_sha: $sha,
-      event: $event,
-      run_url: $url,
-      generated_at: $ts
-    }'
-}
-
-# ---- 6. Anchor attestation to BCOS node ----
-anchor_attestation() {
-  local attestation_json=$1
-  local response
-  response=$(curl -s -X POST "${NODE_URL}/attest" \
-    -H "Content-Type: application/json" \
-    -d "$attestation_json" \
-    --max-time 15 \
-    2>&1) || true
-
-  if echo "$response" | jq -e '.success' >/dev/null 2>&1; then
-    echo "✅ Attestation anchored on-chain"
-    echo "$response"
-  else
-    echo "⚠️  On-chain anchoring unavailable (node: $NODE_URL)"
-    echo "   Attestation saved locally as bcos-attestation.json"
-    echo "$response"
-    # Save locally regardless
-    echo "$attestation_json" > bcos-attestation.json
+  if ! jq -e '.schema == "bcos-attestation/v2"' "$report" >/dev/null; then
+    echo "::error::BCOS engine report is not a v2 attestation"
+    cat "$report"
+    exit 1
+  fi
+  if [[ "$rc" -ne 0 ]]; then
+    echo "::warning::BCOS engine completed but requested tier was not met"
   fi
 }
 
-# ---- 7. Post PR comment with score badge ----
-post_pr_comment() {
-  local score=$1
-  local cert_id=$2
-  local met=$3
-  local file_count=$4
-
-  local badge_url="${NODE_URL}/bcos/badge/${cert_id}-flat.svg"
-  local verify_url="${NODE_URL}/bcos/verify/${cert_id}"
-
-  # Determine badge color based on tier
-  local badge_color="green"
-  case "$TIER" in
-    L2) badge_color="orange" ;;
-    L1) badge_color="blue" ;;
-    L0) badge_color="green" ;;
-  esac
-
-  # Score bar
-  local score_bar
-  score_bar=$(printf '▓%.0s' $(seq 1 $((score / 5))) 2>/dev/null)
-  score_bar+=$(printf '░%.0s' $(seq 1 $((20 - score / 5))) 2>/dev/null)
-
-  local met_icon="✅"
-  [[ "$met" == "false" ]] && met_icon="❌"
-
-  local reviewer_line=""
-  [[ -n "$REVIEWER" ]] && reviewer_line="- 👤 **Reviewer:** @${REVIEWER}"
-
-  local body="<!-- bcos-scan-action v2 -->
-## 🛡️ BCOS v2 Attestation — PR #${PR_NUMBER}
-
-| Field | Value |
-|-------|-------|
-| 🆔 **Cert ID** | \`${cert_id}\` |
-| 📊 **Trust Score** | ${score}/100 ${score_bar} |
-| 🏷️ **Tier** | ${TIER} |
-| ✅ **Tier Met** | ${met_icon} ${met} |
-| 📁 **Files** | ${file_count} |
-| 👤 **Actor** | @${ACTOR} |
-${reviewer_line}
-| 🔗 **Verify** | [BCOS Verify](${verify_url}) |
-
-![BCOS Badge](${badge_url})
-
----
-
-*BCOS v2 Scan — [Source](${RUN_URL}) | [BCOS Docs](https://rustchain.org/bcos)*"
-
-  # Check if a BCOS comment already exists and update it
-  local existing_comment_id
-  existing_comment_id=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
-    -H "Accept: application/vnd.github.v3+json" \
-    "https://api.github.com/repos/${REPO}/issues/${PR_NUMBER}/comments?per_page=100" \
-    | jq -r '.[] | select(.body | contains("bcos-scan-action v2")) | .id' 2>/dev/null | head -1)
-
-  if [[ -n "$existing_comment_id" && "$existing_comment_id" != "null" ]]; then
-    echo "Updating existing BCOS comment (id=$existing_comment_id)"
-    curl -s -X PATCH \
-      -H "Authorization: token $GITHUB_TOKEN" \
-      -H "Content-Type: application/json" \
-      -H "Accept: application/vnd.github.v3+json" \
-      "https://api.github.com/repos/${REPO}/issues/comments/${existing_comment_id}" \
-      -d "$(jq -n --arg body "$body" '{ body: $body }')" >/dev/null
-  else
-    echo "Posting new BCOS comment"
-    curl -s -X POST \
-      -H "Authorization: token $GITHUB_TOKEN" \
-      -H "Content-Type: application/json" \
-      -H "Accept: application/vnd.github.v3+json" \
-      "https://api.github.com/repos/${REPO}/issues/${PR_NUMBER}/comments" \
-      -d "$(jq -n --arg body "$body" '{ body: $body }')" >/dev/null
-  fi
-}
-
-# ---- 8. Set GitHub Action outputs ----
 write_outputs() {
-  local score=$1
-  local cert_id=$2
-  local met=$3
+  local report="$1"
+  local score cert met
+  score=$(jq -r '.trust_score' "$report")
+  cert=$(jq -r '.cert_id' "$report")
+  met=$(jq -r '.tier_met' "$report")
 
-  if [[ -d "$GITHUB_OUTPUT" ]]; then
+  if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
     {
-      echo "trust_score=${score}"
-      echo "cert_id=${cert_id}"
-      echo "tier_met=${met}"
+      echo "trust_score=$score"
+      echo "cert_id=$cert"
+      echo "tier_met=$met"
     } >> "$GITHUB_OUTPUT"
-  else
-    echo "trust_score=${score}" >> "$GITHUB_OUTPUT" 2>/dev/null || true
-    echo "cert_id=${cert_id}" >> "$GITHUB_OUTPUT" 2>/dev/null || true
-    echo "tier_met=${met}" >> "$GITHUB_OUTPUT" 2>/dev/null || true
   fi
 
-  echo "::set-output name=trust_score::${score}"
-  echo "::set-output name=cert_id::${cert_id}"
-  echo "::set-output name=tier_met::${met}"
-  echo "::notice ::BCOS Scan complete — score=${score}, cert_id=${cert_id}, tier_met=${met}"
+  echo "trust_score=$score"
+  echo "cert_id=$cert"
+  echo "tier_met=$met"
 }
 
-# =============================================================================
-# MAIN
-# =============================================================================
+comment_body() {
+  local report="$1"
+  jq -r \
+    --arg run_url "$RUN_URL" \
+    --arg node_url "$NODE_URL" \
+    --arg pr "${PR_NUMBER:-}" \
+    '
+      def row($name; $value): "| " + $name + " | " + $value + " |";
+      ($node_url | sub("/+$"; "")) as $base
+      | (.cert_id // "pending") as $cert
+      | ($base + "/bcos/badge/" + $cert + "-flat.svg") as $badge
+      | ($base + "/bcos/verify/" + $cert) as $verify
+      | "<!-- bcos-scan-action v2 -->\n"
+        + "## BCOS v2 Attestation"
+        + (if $pr != "" then " - PR #" + $pr else "" end) + "\n\n"
+        + "![BCOS Badge](" + $badge + ")\n\n"
+        + "| Field | Value |\n|---|---|\n"
+        + row("Cert ID"; "`" + $cert + "`") + "\n"
+        + row("Trust Score"; ((.trust_score | tostring) + "/100")) + "\n"
+        + row("Tier"; (.tier // "unknown")) + "\n"
+        + row("Tier Met"; (.tier_met | tostring)) + "\n"
+        + row("Reviewer"; (if (.reviewer // "") == "" then "_none_" else "@" + .reviewer end)) + "\n"
+        + row("Commit"; "`" + ((.commit_sha // "unknown") | .[0:12]) + "`") + "\n"
+        + row("Verify"; "[BCOS Verify](" + $verify + ")") + "\n"
+        + row("Run"; "[GitHub Actions](" + $run_url + ")") + "\n\n"
+        + "### Breakdown\n\n"
+        + "| Component | Score |\n|---|---:|\n"
+        + ([
+            (.score_breakdown // {}) | to_entries[]
+            | "| `" + .key + "` | " + (.value | tostring) + " |"
+          ] | join("\n"))
+        + "\n\nGenerated by BCOS v2 using `tools/bcos_engine.py` from Scottcjn/Rustchain."
+    ' "$report"
+}
 
-echo "Fetching PR #${PR_NUMBER} metadata..."
-PR_JSON=$(fetch_pr)
-FILE_COUNT=$(fetch_pr_files | jq '. | length' 2>/dev/null || echo "0")
+post_pr_comment() {
+  local report="$1"
+  if [[ -z "$PR_NUMBER" || -z "$REPO" || -z "$GITHUB_TOKEN" ]]; then
+    echo "Skipping PR comment: PR number, repository, or token unavailable."
+    return
+  fi
 
-TRUST_SCORE=$(compute_trust_score)
-CERT_ID=$(generate_cert_id)
-TIER_MET=$(tier_met "$TRUST_SCORE")
+  local body payload comments_url existing_id
+  body=$(comment_body "$report")
+  payload=$(jq -n --arg body "$body" '{body: $body}')
+  comments_url="https://api.github.com/repos/${REPO}/issues/${PR_NUMBER}/comments"
+  existing_id=$(api GET "${comments_url}?per_page=100" \
+    | jq -r '.[] | select(.body | contains("bcos-scan-action v2")) | .id' \
+    | head -n 1)
 
-echo "Results: score=$TRUST_SCORE, cert_id=$CERT_ID, tier_met=$TIER_MET, files=$FILE_COUNT"
+  if [[ -n "$existing_id" && "$existing_id" != "null" ]]; then
+    api PATCH "https://api.github.com/repos/${REPO}/issues/comments/${existing_id}" "$payload" >/dev/null
+    echo "Updated BCOS PR comment $existing_id"
+  else
+    api POST "$comments_url" "$payload" >/dev/null
+    echo "Posted BCOS PR comment"
+  fi
+}
 
-# Build attestation JSON
-ATTESTATION=$(build_attestation "$TRUST_SCORE" "$CERT_ID" "$TIER_MET")
-echo "Attestation:"
-echo "$ATTESTATION" | jq .
+should_anchor() {
+  [[ -n "${GITHUB_EVENT_PATH:-}" && -f "$GITHUB_EVENT_PATH" ]] || return 1
+  jq -e '
+    (.pull_request.merged == true)
+    or (.head_commit.message // "" | test("Merge pull request #[0-9]+"))
+  ' "$GITHUB_EVENT_PATH" >/dev/null 2>&1
+}
 
-# Anchor on merge
-if [[ "$EVENT" == "pull_request" && "$(echo "$PR_JSON" | jq -r '.merged // "false"' 2>/dev/null)" == "true" ]]; then
-  echo "PR was merged — anchoring attestation on-chain..."
-  anchor_attestation "$ATTESTATION"
-elif [[ "$EVENT" == "push" && "$(echo "$PR_JSON" | jq -r '.merged // "false"' 2>/dev/null)" == "true" ]]; then
-  echo "Push event on merged PR — anchoring attestation on-chain..."
-  anchor_attestation "$ATTESTATION"
-else
-  echo "PR not yet merged — skipping on-chain anchor (will be anchored on merge)"
-  echo "$ATTESTATION" > bcos-attestation-${PR_NUMBER}.json
-fi
+anchor_attestation() {
+  local report="$1"
+  if ! should_anchor; then
+    echo "Skipping RustChain anchor: this event is not a merged PR."
+    return
+  fi
 
-# Always post PR comment
-post_pr_comment "$TRUST_SCORE" "$CERT_ID" "$TIER_MET" "$FILE_COUNT"
+  local response
+  set +e
+  response=$(curl -sS --max-time 20 -X POST "${NODE_URL%/}/attest" \
+    -H "Content-Type: application/json" \
+    --data-binary "@$report" 2>&1)
+  local rc=$?
+  set -e
+  if [[ "$rc" -eq 0 ]]; then
+    echo "RustChain anchor request completed."
+    echo "$response" | jq . 2>/dev/null || echo "$response"
+  else
+    echo "::warning::RustChain anchor request failed; report remains available as an artifact."
+    echo "$response"
+  fi
+}
 
-# Write outputs
-write_outputs "$TRUST_SCORE" "$CERT_ID" "$TIER_MET"
+main() {
+  mkdir -p bcos-artifacts
+  local engine="bcos-artifacts/bcos_engine.py"
+  local report="bcos-artifacts/bcos-attestation.json"
 
-echo "✅ BCOS Scan complete"
+  download_engine "$engine"
+  run_engine "$engine" "$report"
+  write_outputs "$report"
+  post_pr_comment "$report"
+  anchor_attestation "$report"
+  echo "BCOS v2 scan complete."
+}
+
+main "$@"

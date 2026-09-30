@@ -1,113 +1,120 @@
-# BCOS Scan — Reusable GitHub Action (BCOS v2)
+# BCOS Scan - Reusable GitHub Action (BCOS v2)
 
-A reusable GitHub Action that scans PRs, computes a BCOS v2 trust score, generates an attestation certificate, posts a PR comment with a score badge, and optionally anchors the attestation on-chain on merge.
-
----
+A reusable GitHub Action that runs the BCOS v2 engine against any repository,
+publishes `trust_score`, `cert_id`, and `tier_met` outputs, posts a PR comment
+with a score badge and breakdown, and anchors the attestation to RustChain when
+the scan runs for a merged PR.
 
 ## Usage
 
 ```yaml
+name: BCOS
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+
 jobs:
   bcos-scan:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: BCOS Scan
-        uses: ./.github/actions/bcos-scan
+        uses: Scottcjn/bcos-action@v1
         with:
           tier: L1
           reviewer: octocat
+          node-url: https://rustchain.org
           pr-number: ${{ github.event.pull_request.number }}
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 ```
-
----
 
 ## Inputs
 
 | Input | Required | Description |
 |-------|----------|-------------|
-| `tier` | ✅ | Review tier: `L0`, `L1`, or `L2` |
-| `reviewer` | ❌ | GitHub login of the assigned reviewer |
-| `node-url` | ❌ | BCOS v2 node RPC URL. Default: `https://50.28.86.131` |
-| `pr-number` | ❌ | PR number to comment on. Auto-detected from event payload. |
-| `repo-token` | ✅ | `secrets.GITHUB_TOKEN` — required for API calls and comments |
-
----
+| `tier` | No | Review tier: `L0`, `L1`, or `L2`. Default: `L1` |
+| `reviewer` | No | GitHub login of the assigned reviewer. Required for an L2 pass. |
+| `node-url` | No | RustChain node URL. Default: `https://rustchain.org` |
+| `pr-number` | No | PR number to comment on. Auto-detected from the event payload. |
+| `repo-token` | No | Token for PR comments. Defaults to `github.token` when available. |
+| `engine-url` | No | Raw URL for `tools/bcos_engine.py`. Defaults to Scottcjn/Rustchain `main`. |
 
 ## Outputs
 
 | Output | Description |
 |--------|-------------|
-| `trust_score` | BCOS trust score (0–100) |
-| `cert_id` | BCOS attestation certificate ID (e.g. `BCOS-L1-A1B2C3D-39482`) |
-| `tier_met` | Whether the required tier threshold was met (`true` / `false`) |
+| `trust_score` | BCOS trust score (0-100) |
+| `cert_id` | BCOS attestation certificate ID, for example `BCOS-a1b2c3d4` |
+| `tier_met` | Whether the required tier threshold was met (`true` or `false`) |
 
----
+## Engine
 
-## Trust Score Algorithm
+The action downloads and runs
+[`tools/bcos_engine.py`](https://github.com/Scottcjn/Rustchain/blob/main/tools/bcos_engine.py)
+from the Rustchain repo. The engine emits the BCOS v2 attestation JSON and
+calculates the score breakdown defined in the
+[BCOS spec](https://github.com/Scottcjn/Rustchain/blob/main/docs/BEACON_CERTIFIED_OPEN_SOURCE.md).
 
-| Factor | Contribution |
-|--------|-------------|
-| Base by tier | L0: 30 pts, L1: 60 pts, L2: 90 pts |
-| Reviewer assigned | +10 pts |
-| 3+ distinct file paths | +5 pts |
-| **Maximum** | **100 pts** |
-
-**Tier thresholds:** L0 ≥ 30, L1 ≥ 60, L2 ≥ 80
-
----
-
-## Attestation Schema (BCOS v2)
+## Attestation Schema
 
 ```json
 {
   "schema": "bcos-attestation/v2",
-  "cert_id": "BCOS-L1-A1B2C3D-39482",
+  "cert_id": "BCOS-a1b2c3d4",
   "tier": "L1",
   "trust_score": 75,
   "tier_met": true,
-  "pr": {
-    "number": 42,
-    "title": "feat: add BCOS scan action",
-    "state": "open",
-    "base_ref": "main",
-    "head_ref": "feature/bcos-action"
-  },
-  "actor": "octocat",
   "reviewer": "hubot",
-  "head_sha": "abc123def456...",
-  "event": "pull_request",
-  "run_url": "https://github.com/...",
-  "generated_at": "2026-04-04T02:00:00Z"
+  "commit_sha": "abc123def456...",
+  "score_breakdown": {
+    "license_compliance": 20,
+    "vulnerability_scan": 25,
+    "static_analysis": 10
+  },
+  "commitment": "..."
 }
 ```
 
----
-
 ## PR Comment
 
-The action posts (or updates) a formatted PR comment with:
+The action posts or updates a formatted PR comment with:
 
-- 📊 **Trust Score** with a visual bar (▓░)
-- 🆔 **Cert ID** with a copyable code block
-- 🏷️ **Tier** and ✅/❌ **Tier Met** status
-- 📁 File count
-- 🔗 Direct link to the BCOS verification page
-- Embedded BCOS badge image (served from the node)
+- Trust score
+- Cert ID
+- Tier and tier pass/fail status
+- Score breakdown from the engine
+- Direct link to the BCOS verification page
+- Embedded BCOS badge image served from the node
 
----
+## RustChain Anchoring
 
-## On-Chain Anchoring
+On `pull_request.closed` events where `pull_request.merged == true`, the action
+POSTs the attestation JSON to `${node-url}/attest`. If the node is unavailable,
+the JSON remains in `bcos-artifacts/bcos-attestation.json`.
 
-On `pull_request` events where `pull_request.merged == true`, the action POSTs the attestation JSON to `${node-url}/attest`. If the node is unavailable, the attestation is saved locally as `bcos-attestation-${PR_NUMBER}.json`.
+## Example With Outputs
 
----
+```yaml
+- id: bcos
+  uses: Scottcjn/bcos-action@v1
+  with:
+    tier: L0
 
-## BCOS v2 Context
+- run: |
+    echo "score=${{ steps.bcos.outputs.trust_score }}"
+    echo "cert=${{ steps.bcos.outputs.cert_id }}"
+    echo "met=${{ steps.bcos.outputs.tier_met }}"
+```
 
-BCOS v2 is RustChain's on-chain bounty certification and trust attestation protocol. Learn more at [rustchain.org/bcos](https://rustchain.org/bcos).
+## License
 
-**Badge endpoint:** `GET https://50.28.86.131/bcos/badge/{cert_id}-{style}.svg`  
-**Verify page:** `https://rustchain.org/bcos/verify/{cert_id}`
+MIT. The action runs the MIT-licensed BCOS v2 engine from Rustchain.
