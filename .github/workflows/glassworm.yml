@@ -1,22 +1,11 @@
-name: The Glassworm Protocol
+name: glassworm.yml (DISABLED - billing protection)
 on:
-  pull_request_target:
-    types: [opened, synchronize, reopened]
-
+  workflow_dispatch:
 permissions:
   contents: read
-  issues: write
-  pull-requests: write
-
 jobs:
-  verify-poa:
+  disabled:
+    if: ${{ false }}
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v7
-
-      - name: Run Glassworm Sentinel
-        uses: ./glassworm-protocol
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          rpc-url: 'https://rpc.rustchain.network'
+      - run: echo 'Disabled by repository owner to prevent GitHub Actions charges'
